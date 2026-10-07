@@ -1,0 +1,94 @@
+name: Build Hermes Light (Windows)
+
+# Builds the *Light* Hermes Desktop client (remote-only: no bundled Python /
+# local agent) for Windows on a GitHub-hosted runner, so nothing has to be
+# installed or built on your own machine.
+#
+# Two artifacts come out of a run:
+#   1. hermes-light-windows artifact -> contains
+#        - HermesLight-win-x64-portable.zip  (unzip and run; no install, no trust step)
+#        - HermesLight-<version>-win-x64.msix (unsigned; needs a trusted cert to sideload)
+#   2. Nothing is signed: upstream signs with an Azure Trusted Signing cert that
+#      only Nous Research has, so expect a SmartScreen "unknown publisher" prompt.
+#
+# Usage: Actions -> "Build Hermes Light (Windows)" -> Run workflow.
+# Node comes from the repo's own pin (.nvmrc = 26), deps from package-lock.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Desktop variant to package"
+        type: choice
+        default: light
+        options:
+          - light
+          - bundled
+      make_msix:
+        description: "Also produce the MSIX (needs the Windows SDK; may fail, job continues)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    env:
+      HERMES_DESKTOP_VARIANT: ${{ inputs.variant }}
+      # No signing identity in CI here: keep electron-builder from hunting for one.
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\.cache\electron-builder
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node (repo pin)
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install locked desktop deps
+        # Same locked install the upstream release workflow uses: desktop
+        # workspace + root, no Electron/native postinstall scripts.
+        run: npm ci --workspace apps/desktop --include-workspace-root --include=dev --ignore-scripts --no-audit --no-fund
+
+      - name: Build renderer + Electron main
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Package MSIX (unsigned, best effort)
+        if: ${{ inputs.make_msix }}
+        id: msix
+        working-directory: apps/desktop
+        continue-on-error: true
+        run: npm run builder -- --win msix --publish never
+
+      - name: Package portable (win-unpacked)
+        working-directory: apps/desktop
+        run: npm run builder -- --win --dir --publish never
+
+      - name: Zip the portable build
+        shell: pwsh
+        run: |
+          $src = "apps/desktop/release/win-unpacked"
+          if (-not (Test-Path $src)) { throw "portable output missing: $src" }
+          Compress-Archive -Path "$src\*" -DestinationPath "HermesLight-win-x64-portable.zip" -CompressionLevel Optimal
+          Get-ChildItem "apps/desktop/release" | Select-Object Name, Length
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-light-windows
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            HermesLight-win-x64-portable.zip
+            apps/desktop/release/*.msix
+            apps/desktop/release/*.msixbundle
+            apps/desktop/release/*.appinstaller
